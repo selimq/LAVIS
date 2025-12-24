@@ -122,10 +122,6 @@ def create_interface():
             
             Upload an image and ask questions
             
-            **Features:**
-            - Automatic image captioning
-            - Visual Question Answering (VQA)
-            - Chat-style interaction
             """
         )
         
@@ -162,7 +158,7 @@ def create_interface():
                 clear_btn = gr.Button("🗑️ Clear Chat")
         
         # Example questions
-        gr.Markdown("### 💡 Example Questions")
+        gr.Markdown("###Example Questions")
         gr.Examples(
             examples=[
                 "What is in the image?",
