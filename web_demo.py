@@ -176,6 +176,16 @@ def create_interface():
             label=""
         )
         
+        # Ethical disclaimer
+        gr.Markdown(
+            """
+            ---
+            ⚠️ **Important Disclaimer:** This AI system may produce inaccurate, biased, or misleading outputs. 
+            Do not rely on AI-generated content for critical decisions. Always verify information independently 
+            and use your own judgment. AI responses should be treated as suggestions, not facts.
+            """
+        )
+        
         # Event handlers
         caption_btn.click(
             fn=generate_caption,
