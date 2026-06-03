@@ -11,7 +11,6 @@ This opens a web UI where you can:
 3. Generate an ordered action timeline describing what happens over time.
 """
 
-import json
 import os
 import tempfile
 from typing import Dict, List, Tuple
@@ -22,7 +21,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from lavis.common.utils import download_url
 from lavis.models import load_model_and_preprocess
 
 # Global model state
@@ -32,13 +30,6 @@ VIS_PROCESSORS_VIDEO_QA = None
 TXT_PROCESSORS_VIDEO_QA = None
 MODEL_CAPTION = None
 VIS_PROCESSORS_CAPTION = None
-LABEL2ANSWER = {}
-
-MSRVTT_ANS2LABEL_URL = (
-    "https://storage.googleapis.com/sfr-vision-language-research/"
-    "LAVIS/datasets/msrvtt/train_ans2label.json"
-)
-MSRVTT_ANS2LABEL_REL_PATH = "msrvtt/annotations/qa_ans2label.json"
 
 
 def resolve_writable_cache_root() -> str:
@@ -74,38 +65,19 @@ def resolve_writable_cache_root() -> str:
     )
 
 
-def load_answer_vocab(cache_root: str) -> Dict[int, str]:
-    """Download/load answer mapping and build label-index to answer text map."""
-    ans2label_path = os.path.join(cache_root, MSRVTT_ANS2LABEL_REL_PATH)
-    os.makedirs(os.path.dirname(ans2label_path), exist_ok=True)
-
-    if not os.path.exists(ans2label_path):
-        download_url(
-            url=MSRVTT_ANS2LABEL_URL,
-            root=os.path.dirname(ans2label_path),
-            filename=os.path.basename(ans2label_path),
-        )
-
-    with open(ans2label_path, "r", encoding="utf-8") as f:
-        ans2label = json.load(f)
-
-    # Stored format is usually {answer_text: class_index}.
-    return {int(label): answer for answer, label in ans2label.items()}
-
-
 def load_models() -> None:
     """Load all models once at startup."""
     global DEVICE, MODEL_VIDEO_QA, VIS_PROCESSORS_VIDEO_QA, TXT_PROCESSORS_VIDEO_QA
-    global MODEL_CAPTION, VIS_PROCESSORS_CAPTION, LABEL2ANSWER
+    global MODEL_CAPTION, VIS_PROCESSORS_CAPTION
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {DEVICE}")
 
-    print("Loading VideoQA model (ALPRO, MSRVTT)...")
+    print("Loading VideoQA model (BLIP, VQAv2)...")
     MODEL_VIDEO_QA, VIS_PROCESSORS_VIDEO_QA, TXT_PROCESSORS_VIDEO_QA = (
         load_model_and_preprocess(
-            name="alpro_qa",
-            model_type="msrvtt",
+            name="blip_vqa",
+            model_type="vqav2",
             is_eval=True,
             device=DEVICE,
         )
@@ -120,10 +92,7 @@ def load_models() -> None:
     )
 
     cache_root = resolve_writable_cache_root()
-    print(f"Using answer cache: {cache_root}")
-
-    print("Loading answer vocabulary...")
-    LABEL2ANSWER = load_answer_vocab(cache_root=cache_root)
+    print(f"Using demo cache root: {cache_root}")
 
     print("Video demo models loaded successfully!")
 
@@ -178,7 +147,7 @@ def answer_video_question(
     top_k: int,
     chat_history: List[Tuple[str, str]],
 ):
-    """Answer question about a video with ALPRO VideoQA model."""
+    """Answer question about a video with BLIP VQA using sampled keyframes."""
     if chat_history is None:
         chat_history = []
 
@@ -191,38 +160,62 @@ def answer_video_question(
         return "", chat_history
 
     try:
-        processed_video = VIS_PROCESSORS_VIDEO_QA["eval"](video_path).unsqueeze(0).to(DEVICE)
         processed_question = TXT_PROCESSORS_VIDEO_QA["eval"](clean_question)
 
-        # ALPRO QA expects an "answers" tensor even during inference.
-        samples = {
-            "video": processed_video,
-            "text_input": [processed_question],
-            "answers": torch.zeros(1, dtype=torch.long, device=DEVICE),
-        }
+        num_frames = max(1, min(int(top_k), 5))
+        sampled_frames = extract_keyframes(video_path=video_path, num_steps=num_frames)
 
-        with torch.inference_mode():
-            output = MODEL_VIDEO_QA.predict(samples)
-            logits = output["predictions"]
-            probs = torch.softmax(logits, dim=-1)
+        frame_answers: List[Tuple[str, float]] = []
+        for frame_pil, timestamp in sampled_frames:
+            processed_image = VIS_PROCESSORS_VIDEO_QA["eval"](frame_pil).unsqueeze(0).to(DEVICE)
+            samples = {
+                "image": processed_image,
+                "text_input": [processed_question],
+            }
 
-            k = max(1, min(int(top_k), probs.shape[-1]))
-            top_probs, top_indices = torch.topk(probs, k=k, dim=-1)
+            with torch.inference_mode():
+                answers = MODEL_VIDEO_QA.predict_answers(
+                    samples,
+                    inference_method="generate",
+                    num_beams=3,
+                    max_len=12,
+                    min_len=1,
+                )
 
-        best_idx = int(top_indices[0, 0].item())
-        best_conf = float(top_probs[0, 0].item())
-        best_answer = LABEL2ANSWER.get(best_idx, f"class_{best_idx}")
+            answer = (answers[0] if answers else "").strip()
+            if answer:
+                frame_answers.append((answer, timestamp))
 
-        response_lines = [f"Answer: {best_answer}", f"Confidence: {best_conf:.2%}"]
+        if not frame_answers:
+            chat_history.append((clean_question, "Could not generate an answer from sampled frames."))
+            return "", chat_history
 
-        if k > 1:
-            alternatives = []
-            for rank in range(1, k):
-                idx = int(top_indices[0, rank].item())
-                conf = float(top_probs[0, rank].item())
-                alt_answer = LABEL2ANSWER.get(idx, f"class_{idx}")
-                alternatives.append(f"{rank}. {alt_answer} ({conf:.2%})")
-            response_lines.append("Alternatives:\n" + "\n".join(alternatives))
+        # Pick the most frequent normalized answer across sampled frames.
+        counts: Dict[str, int] = {}
+        canonical: Dict[str, str] = {}
+        for answer, _ in frame_answers:
+            norm = answer.lower().strip()
+            counts[norm] = counts.get(norm, 0) + 1
+            canonical.setdefault(norm, answer)
+
+        ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+        best_norm, best_votes = ranked[0]
+        best_answer = canonical[best_norm]
+
+        response_lines = [
+            f"Answer: {best_answer}",
+            f"Consensus: {best_votes}/{len(frame_answers)} sampled frame(s)",
+        ]
+
+        if len(ranked) > 1:
+            alt_lines = []
+            for rank, (norm, votes) in enumerate(ranked[1:4], start=1):
+                alt_lines.append(f"{rank}. {canonical[norm]} ({votes}/{len(frame_answers)} frames)")
+            response_lines.append("Alternatives:\n" + "\n".join(alt_lines))
+
+        response_lines.append("Frame-wise answers:")
+        for answer, timestamp in frame_answers:
+            response_lines.append(f"- [{format_timestamp(timestamp)}] {answer}")
 
         chat_history.append((clean_question, "\n".join(response_lines)))
         return "", chat_history
@@ -321,7 +314,7 @@ def create_interface():
                     maximum=5,
                     value=3,
                     step=1,
-                    label="Show Top-K Predictions",
+                    label="Sampled Frames for Video QA",
                 )
 
                 clear_btn = gr.Button("Clear Chat")
